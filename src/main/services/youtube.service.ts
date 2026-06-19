@@ -28,130 +28,144 @@ function parseDuration(text: string | undefined): number {
   return parts[0] || 0
 }
 
-function fetchUrl(url: string): Promise<string> {
+const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8'
+
+function postInnerTube(endpoint: string, body: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const request = net.request(url)
-    request.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+    const request = net.request({
+      method: 'POST',
+      url: `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_KEY}`
+    })
+    request.setHeader('Content-Type', 'application/json')
+    request.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     request.setHeader('Accept-Language', 'tr-TR,tr;q=0.9')
+    request.setHeader('X-YouTube-Client-Name', '1')
+    request.setHeader('X-YouTube-Client-Version', '2.20240101.01.00')
     let data = ''
-    request.on('response', (response) => {
-      response.on('data', (chunk) => {
-        data += chunk.toString()
-      })
-      response.on('end', () => resolve(data))
+    request.on('response', (res) => {
+      res.on('data', (chunk) => { data += chunk.toString() })
+      res.on('end', () => resolve(data))
     })
     request.on('error', reject)
+    request.write(body)
     request.end()
   })
 }
 
+function makeNextBody(playlistId: string, videoId?: string, continuation?: string): string {
+  return JSON.stringify({
+    context: {
+      client: {
+        clientName: 'WEB',
+        clientVersion: '2.20240101.01.00',
+        hl: 'tr',
+        gl: 'TR'
+      }
+    },
+    ...(continuation
+      ? { continuation }
+      : {
+          playlistId,
+          ...(videoId ? { videoId } : {}),
+          params: 'OAI%3D'  // include all playlist items
+        })
+  })
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractVideosFromData(data: any): PlaylistVideo[] {
-  const videos: PlaylistVideo[] = []
+function extractFromPlaylistPanel(data: any, videos: PlaylistVideo[]): string | null {
+  // Primary path: watch next panel
+  const panels = data?.contents?.twoColumnWatchNextResults?.playlist?.playlist
+  const playlistContents = panels?.contents
 
-  const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs
-  if (!tabs) return videos
+  // Continuation path
+  const contContents =
+    data?.continuationContents?.playlistPanelContinuation?.contents ??
+    data?.onResponseReceivedEndpoints?.[0]?.appendContinuationItemsAction?.continuationItems
 
-  const contents =
-    tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer
-      ?.contents?.[0]?.playlistVideoListRenderer?.contents
+  const items = playlistContents ?? contContents
+  if (!Array.isArray(items)) return null
 
-  if (!Array.isArray(contents)) return videos
+  for (const item of items) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const v = (item as any)?.playlistPanelVideoRenderer
+    if (!v?.videoId) continue
 
-  for (const item of contents) {
-    const v = item.playlistVideoRenderer
-    if (!v || !v.videoId) continue
+    const durationOverlay = v.thumbnailOverlays?.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (o: any) => o?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText
+    )
+    const durationText = durationOverlay?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText
 
-    const title = v.title?.runs?.[0]?.text ?? ''
-    const videoId = v.videoId
-    const idx = v.index?.simpleText ? parseInt(v.index.simpleText, 10) - 1 : videos.length
-    const durationText = v.lengthText?.simpleText
-    const durationSeconds = parseDuration(durationText)
-    const thumbnailUrl =
-      v.thumbnail?.thumbnails?.slice(-1)[0]?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+    const position = v.index?.simpleText ? parseInt(v.index.simpleText, 10) : videos.length
 
-    videos.push({ videoId, title, thumbnailUrl, durationSeconds, position: idx })
+    videos.push({
+      videoId: v.videoId,
+      title: v.title?.simpleText ?? v.title?.runs?.[0]?.text ?? '',
+      thumbnailUrl:
+        v.thumbnail?.thumbnails?.slice(-1)[0]?.url ??
+        `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+      durationSeconds: parseDuration(durationText),
+      position
+    })
   }
 
-  return videos
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lastItem = (items as any[])[items.length - 1]
+  return (
+    lastItem?.playlistPanelVideoRenderer === undefined
+      ? lastItem?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token
+      : null
+  ) ?? null
 }
 
 export async function fetchPlaylist(playlistId: string): Promise<PlaylistResult> {
-  const url = `https://www.youtube.com/playlist?list=${playlistId}`
-  const html = await fetchUrl(url)
+  const videos: PlaylistVideo[] = []
 
-  const match = html.match(/var ytInitialData = ({.*?});<\/script>/s)
-  if (!match) throw new Error('Playlist verileri alinamadi')
+  // Step 1: get first video ID from browse (to seed the next endpoint)
+  const browseBody = JSON.stringify({
+    context: { client: { clientName: 'WEB', clientVersion: '2.20240101.01.00', hl: 'tr', gl: 'TR' } },
+    browseId: 'VL' + playlistId
+  })
+  const browseResp = await postInnerTube('browse', browseBody)
+  const browseData = JSON.parse(browseResp)
 
-  const data = JSON.parse(match[1])
+  // Extract thumbnail from browse data
+  const thumbnailUrl =
+    browseData?.header?.playlistHeaderRenderer?.thumbnail?.thumbnails?.slice(-1)[0]?.url ||
+    browseData?.microformat?.microformatDataRenderer?.thumbnail?.thumbnails?.slice(-1)[0]?.url ||
+    ''
 
-  let videos = extractVideosFromData(data)
-
-  // Handle continuation (playlists with 100+ videos)
-  const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs
-  const contents =
-    tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer
-      ?.contents?.[0]?.playlistVideoListRenderer?.contents
-
-  if (Array.isArray(contents)) {
-    const lastItem = contents[contents.length - 1]
-    let continuation = lastItem?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token
-
-    while (continuation) {
-      const apiUrl = `https://www.youtube.com/youtubei/v1/browse?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8`
-      const body = JSON.stringify({
-        context: { client: { clientName: 'WEB', clientVersion: '2.20240101' } },
-        continuation
-      })
-
-      const contHtml = await new Promise<string>((resolve, reject) => {
-        const request = net.request({ method: 'POST', url: apiUrl })
-        request.setHeader('Content-Type', 'application/json')
-        request.setHeader('User-Agent', 'Mozilla/5.0')
-        let d = ''
-        request.on('response', (response) => {
-          response.on('data', (chunk) => { d += chunk.toString() })
-          response.on('end', () => resolve(d))
-        })
-        request.on('error', reject)
-        request.write(body)
-        request.end()
-      })
-
-      const contData = JSON.parse(contHtml)
-      const actions = contData?.onResponseReceivedActions
-      const newContents =
-        actions?.[0]?.appendContinuationItemsAction?.continuationItems
-
-      if (!Array.isArray(newContents)) break
-
-      for (const item of newContents) {
-        const v = item.playlistVideoRenderer
-        if (!v || !v.videoId) continue
-
-        const title = v.title?.runs?.[0]?.text ?? ''
-        const videoId = v.videoId
-        const idx = v.index?.simpleText ? parseInt(v.index.simpleText, 10) - 1 : videos.length
-        const durationText = v.lengthText?.simpleText
-        const durationSeconds = parseDuration(durationText)
-        const thumbnailUrl =
-          v.thumbnail?.thumbnails?.slice(-1)[0]?.url ?? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
-
-        videos.push({ videoId, title, thumbnailUrl, durationSeconds, position: idx })
-      }
-
-      const lastCont = newContents[newContents.length - 1]
-      continuation = lastCont?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token || null
+  // Get first videoId from browse data (any lockupViewModel or playlistVideoRenderer)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let firstVideoId: string | undefined
+  const lockupContents =
+    browseData?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]
+      ?.itemSectionRenderer?.contents
+  if (Array.isArray(lockupContents)) {
+    for (const item of lockupContents) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lv = (item as any)?.lockupViewModel
+      if (lv?.contentId) { firstVideoId = lv.contentId; break }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pv = (item as any)?.playlistVideoRenderer
+      if (pv?.videoId) { firstVideoId = pv.videoId; break }
     }
   }
 
-  // Sort by position
+  // Step 2: use next endpoint to get all videos with durations
+  const firstNextResp = await postInnerTube('next', makeNextBody(playlistId, firstVideoId))
+  const firstNextData = JSON.parse(firstNextResp)
+
+  let continuation = extractFromPlaylistPanel(firstNextData, videos)
+
+  while (continuation) {
+    const contResp = await postInnerTube('next', makeNextBody(playlistId, undefined, continuation))
+    const contData = JSON.parse(contResp)
+    continuation = extractFromPlaylistPanel(contData, videos)
+  }
+
   videos.sort((a, b) => a.position - b.position)
-
-  // Playlist thumbnail = first video thumbnail or playlist header
-  const headerThumbnail =
-    data?.microformat?.microformatDataRenderer?.thumbnail?.thumbnails?.slice(-1)[0]?.url
-  const thumbnailUrl = headerThumbnail || videos[0]?.thumbnailUrl || ''
-
-  return { thumbnailUrl, videos }
+  return { thumbnailUrl: thumbnailUrl || videos[0]?.thumbnailUrl || '', videos }
 }

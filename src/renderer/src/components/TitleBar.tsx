@@ -29,7 +29,7 @@ function daysUntil(date: Date, now: Date): number {
 }
 
 function formatDaily(totalSeconds: number, daysLeft: number): string {
-  if (daysLeft <= 0) return '—'
+  if (daysLeft <= 0 || totalSeconds <= 0) return '—'
   const daily = Math.ceil(totalSeconds / daysLeft)
   const h = Math.floor(daily / 3600)
   const m = Math.floor((daily % 3600) / 60)
