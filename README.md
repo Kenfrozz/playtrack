@@ -1,5 +1,7 @@
 # PlayTrack
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 PlayTrack, YouTube oynatma listeleri üzerinden ders takibi yapmanı sağlayan masaüstü bir uygulamadır. Electron, React, Vite ve SQLite kullanılarak geliştirilmiştir.
 
 ## Özellikler
@@ -89,3 +91,7 @@ resources/     Uygulama ikonları
 
 - Ders videoları YouTube playlist verileri okunarak alınır.
 - Playlist verileri alınamazsa ders yine eklenir, videolar daha sonra yenilenebilir.
+
+## Lisans
+
+MIT — bkz. [LICENSE](LICENSE)
